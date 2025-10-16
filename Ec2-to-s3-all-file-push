@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ========================================
+#   EC2 → S3 Backup Script (Fully Interactive)
+# ========================================
+
+# ===== USER INPUT =====
+echo "Enter AWS Region [default: us-east-1]: "
+read -r USER_REGION
+REGION="${USER_REGION:-us-east-1}"  # default to us-east-1 if empty
+
+# Ask for bucket name (required)
+while true; do
+  read -rp "Enter S3 Bucket Name (required): " S3_BUCKET
+  if [ -n "${S3_BUCKET}" ]; then
+    break
+  else
+    echo "Bucket name cannot be empty. Please enter a valid name."
+  fi
+done
+
+# ===== CONFIG =====
+BACKUP_SOURCE="/home/ec2-user"        # directory to back up
+BACKUP_DIR="/tmp/ec2-backups"         # local staging dir
+RETENTION_DAYS=7                      # remove local archives older than this
+MAX_UPLOAD_RETRIES=3
+S3_PREFIX=""                           # optional prefix inside bucket (e.g., "backups")
+# ==================
+
+log() { echo -e "[\e[32m$(date +'%F %T')\e[0m] $*"; }
+warn() { echo -e "[\e[33mWARNING\e[0m] $*"; }
+error_exit() { echo -e "[\e[31mERROR\e[0m] $*" >&2; exit 1; }
+
+# ===== PRE-CHECKS =====
+if ! command -v aws >/dev/null 2>&1; then
+  error_exit "AWS CLI not installed. Please install and configure or attach an IAM role."
+fi
+if ! command -v tar >/dev/null 2>&1; then
+  error_exit "tar command not found."
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  warn "jq not found (optional)."
+fi
+
+mkdir -p "${BACKUP_DIR}"
+
+# ===== PREPARE BACKUP =====
+HOST_SAFE=$(hostname -s | tr ' ' '_' | tr '/' '_' )
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+ARCHIVE_NAME="backup-${HOST_SAFE}-${TIMESTAMP}.tar.gz"
+ARCHIVE_PATH="${BACKUP_DIR}/${ARCHIVE_NAME}"
+
+log "Creating compressed archive of ${BACKUP_SOURCE}..."
+tar --preserve-permissions -czpf "${ARCHIVE_PATH}" -C / $(realpath --relative-to=/ "${BACKUP_SOURCE}") 2>/dev/null || {
+  tar -czpf "${ARCHIVE_PATH}" "${BACKUP_SOURCE}"
+}
+log "Archive created at ${ARCHIVE_PATH}"
+
+# ===== BUCKET VALIDATION =====
+log "Verifying S3 bucket: ${S3_BUCKET} (region ${REGION})..."
+set +e
+aws --region "${REGION}" s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1
+HEAD_EXIT=$?
+set -e
+
+if [ "${HEAD_EXIT}" -ne 0 ]; then
+  warn "Bucket ${S3_BUCKET} not found or not accessible."
+  read -rp "Do you want to create this bucket in region ${REGION}? (yes/no) [default: yes]: " CREATE_CHOICE
+  CREATE_CHOICE=${CREATE_CHOICE:-yes}
+
+  if [[ "${CREATE_CHOICE,,}" =~ ^(y|yes)$ ]]; then
+    log "Creating bucket ${S3_BUCKET} ..."
+    if [ "${REGION}" = "us-east-1" ]; then
+      aws --region "${REGION}" s3api create-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1 || error_exit "Bucket creation failed."
+    else
+      aws --region "${REGION}" s3api create-bucket \
+        --bucket "${S3_BUCKET}" \
+        --create-bucket-configuration LocationConstraint="${REGION}" >/dev/null 2>&1 || error_exit "Bucket creation failed."
+    fi
+
+    log "Bucket created successfully."
+    aws --region "${REGION}" s3api put-bucket-versioning \
+      --bucket "${S3_BUCKET}" --versioning-configuration Status=Enabled >/dev/null 2>&1 || warn "Failed to enable versioning."
+    aws --region "${REGION}" s3api put-bucket-encryption \
+      --bucket "${S3_BUCKET}" \
+      --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null 2>&1 || warn "Failed to enable encryption."
+  else
+    error_exit "Bucket not found. Aborting backup."
+  fi
+else
+  log "Bucket exists and is accessible."
+fi
+
+# ===== UPLOAD =====
+if [ -n "${S3_PREFIX}" ]; then
+  DEST_KEY="${S3_PREFIX%/}/${ARCHIVE_NAME}"
+else
+  DEST_KEY="${ARCHIVE_NAME}"
+fi
+
+log "Backup ready to upload to s3://${S3_BUCKET}/${DEST_KEY}"
+read -rp "Proceed with upload? (yes/no) [default: yes]: " CONFIRM_UPLOAD
+CONFIRM_UPLOAD=${CONFIRM_UPLOAD:-yes}
+if [[ ! "${CONFIRM_UPLOAD,,}" =~ ^(y|yes)$ ]]; then
+  warn "Upload canceled by user."
+  exit 0
+fi
+
+upload_attempt=0
+while [ $upload_attempt -lt $MAX_UPLOAD_RETRIES ]; do
+  upload_attempt=$((upload_attempt+1))
+  log "Uploading (attempt ${upload_attempt}) ..."
+  set +e
+  aws --region "${REGION}" s3 cp "${ARCHIVE_PATH}" "s3://${S3_BUCKET}/${DEST_KEY}"
+  UP_EXIT=$?
+  set -e
+  if [ $UP_EXIT -eq 0 ]; then
+    log "✅ Upload successful!"
+    break
+  else
+    warn "Upload failed (exit $UP_EXIT). Retrying in 5s..."
+    sleep 5
+  fi
+done
+
+if [ $UP_EXIT -ne 0 ]; then
+  error_exit "Upload failed after ${MAX_UPLOAD_RETRIES} attempts. Archive left at ${ARCHIVE_PATH}"
+fi
+
+# ===== CLEANUP =====
+log "Cleaning local archives older than ${RETENTION_DAYS} days..."
+find "${BACKUP_DIR}" -type f -name "backup-*.tar.gz" -mtime +"${RETENTION_DAYS}" -print -exec rm -f {} \;
+
+log "✅ Backup complete!"
+log "Remote path: s3://${S3_BUCKET}/${DEST_KEY}"
+exit 0
