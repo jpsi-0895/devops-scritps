@@ -2,299 +2,335 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# ========================================
-#   EC2 → S3 Backup Script (Interactive, nested prefixes with Year+Month)
-# ========================================
+# ----------------------
+# Configuration - EDIT
+# ----------------------
+REGION="us-east-1"                        # N. Virginia
+AWS_PROFILE=""                            # optional: set to profile name or leave empty
+BUCKET_NAME="ec2-backups-$(date +%s)"     # must be globally unique
+KEY_NAME="ec2-backup-key-$(date +%s)"     # SSH keypair name
+INSTANCE_TYPE="t3.micro"
+INSTANCE_NAME="ec2-backup-instance"
+IAM_ROLE_NAME="EC2_S3_Backup_Role_$(date +%s)"
+INSTANCE_PROFILE_NAME="${IAM_ROLE_NAME}-profile"
+SEC_GROUP_NAME="ec2-backup-sg-$(date +%s)"
+BACKUP_DIR="/backup"
+CREATE_SNAPSHOTS="yes"                    # yes/no
+SNAPSHOT_TAG="AutoBackup"
+# The set of S3 subfolders to create & seed
+S3_PREFIXES=("sales" "inventory" "workshop" "backup")
+# ----------------------
 
-# ===== Defaults (change if you like) =====
-DEFAULT_REGION="us-east-1"
-DEFAULT_BACKUP_SOURCE="/home/ec2-user"
-DEFAULT_BACKUP_DIR="/tmp/ec2-backups"
-DEFAULT_RETENTION_DAYS=7
-DEFAULT_MAX_UPLOAD_RETRIES=5
-LOGFILE="${HOME}/ec2-s3-backup.log"
-# =========================================
-
-# helpers
-log() { printf "[%s] %b\n" "$(date +'%F %T')" "$*"; echo "[INFO] $(date +'%F %T') $*" >> "${LOGFILE}"; }
-warn() { printf "[%s] WARNING: %b\n" "$(date +'%F %T')" "$*" >&2; echo "[WARN] $(date +'%F %T') $*" >> "${LOGFILE}"; }
-error_exit() { printf "[%s] ERROR: %b\n" "$(date +'%F %T')" "$*" >&2; echo "[ERROR] $(date +'%F %T') $*" >> "${LOGFILE}"; exit 1; }
-
-# ensure log file exists
-touch "${LOGFILE}" 2>/dev/null || { echo "Cannot write log to ${LOGFILE}. Using /tmp/ec2-s3-backup.log"; LOGFILE="/tmp/ec2-s3-backup.log"; touch "${LOGFILE}"; }
-
-trap 'rm -f "${TMP_CLEANUP:-}" >/dev/null 2>&1 || true' EXIT
-
-# pre-checks
-command -v aws >/dev/null 2>&1 || error_exit "AWS CLI not found."
-command -v tar >/dev/null 2>&1 || error_exit "tar not found."
-
-# -------------------------
-# Interactive inputs
-# -------------------------
-read -rp "AWS profile to use (leave empty for default): " AWS_PROFILE
-AWS_PROFILE="${AWS_PROFILE:-}"
-
-read -rp "AWS region [${DEFAULT_REGION}]: " USER_REGION
-REGION="${USER_REGION:-${DEFAULT_REGION}}"
-
-while :; do
-  read -rp "S3 Bucket name (required): " S3_BUCKET
-  [ -n "${S3_BUCKET}" ] && break
-  echo "Bucket name cannot be empty."
-done
-
-read -rp "Local directory to back up [${DEFAULT_BACKUP_SOURCE}]: " BACKUP_SOURCE
-BACKUP_SOURCE="${BACKUP_SOURCE:-${DEFAULT_BACKUP_SOURCE}}"
-
-read -rp "Local staging dir [${DEFAULT_BACKUP_DIR}]: " BACKUP_DIR
-BACKUP_DIR="${BACKUP_DIR:-${DEFAULT_BACKUP_DIR}}"
-
-read -rp "Retention days for local archives [${DEFAULT_RETENTION_DAYS}]: " RETENTION_DAYS
-RETENTION_DAYS="${RETENTION_DAYS:-${DEFAULT_RETENTION_DAYS}}"
-
-read -rp "Max upload retries [${DEFAULT_MAX_UPLOAD_RETRIES}]: " MAX_UPLOAD_RETRIES
-MAX_UPLOAD_RETRIES="${MAX_UPLOAD_RETRIES:-${DEFAULT_MAX_UPLOAD_RETRIES}}"
-
-# These values are inferred from the image you provided:
-read -rp "Year for folder structure [default: current year]: " YEAR_IN
-YEAR="${YEAR_IN:-$(date +%Y)}"
-
-# NEW: Month option (two-digit by default)
-read -rp "Month for folder structure [default: current month (01-12)]: " MONTH_IN
-# normalize month to two digits
-if [ -z "${MONTH_IN}" ]; then
-  MONTH="$(date +%m)"
-else
-  # allow user to enter number or name; try to normalize
-  case "${MONTH_IN}" in
-    1|01) MONTH="01";;
-    2|02) MONTH="02";;
-    3|03) MONTH="03";;
-    4|04) MONTH="04";;
-    5|05) MONTH="05";;
-    6|06) MONTH="06";;
-    7|07) MONTH="07";;
-    8|08) MONTH="08";;
-    9|09) MONTH="09";;
-    10) MONTH="10";;
-    11) MONTH="11";;
-    12) MONTH="12";;
-    Jan|jan|JAN) MONTH="01";;
-    Feb|feb|FEB) MONTH="02";;
-    Mar|mar|MAR) MONTH="03";;
-    Apr|apr|APR) MONTH="04";;
-    May|may|MAY) MONTH="05";;
-    Jun|jun|JUN) MONTH="06";;
-    Jul|jul|JUL) MONTH="07";;
-    Aug|aug|AUG) MONTH="08";;
-    Sep|sep|SEP|Sept|sept|SEPT) MONTH="09";;
-    Oct|oct|OCT) MONTH="10";;
-    Nov|nov|NOV) MONTH="11";;
-    Dec|dec|DEC) MONTH="12";;
-    *) 
-      echo "Invalid month input. Defaulting to current month."
-      MONTH="$(date +%m)"
-      ;;
-  esac
-fi
-
-read -rp "Batch / identifier (image showed '112') [default: 112]: " BATCH_IN
-BATCH="${BATCH_IN:-112}"
-
-read -rp "Remove local archive after upload? (yes/no) [default: no]: " REMOVE_LOCAL
-REMOVE_LOCAL="${REMOVE_LOCAL:-no}"
-
-read -rp "Also sync seeded folders to S3? (yes/no) [default: yes]: " SYNC_SEEDED
-SYNC_SEEDED="${SYNC_SEEDED:-yes}"
-
-# Build AWS CLI base
-AWS_CLI=(aws --region "${REGION}")
-if [ -n "${AWS_PROFILE}" ]; then AWS_CLI+=(--profile "${AWS_PROFILE}"); fi
-aws_run() { "${AWS_CLI[@]}" "$@"; }
-
-log "Starting. Bucket=${S3_BUCKET} Region=${REGION} Source=${BACKUP_SOURCE} Staging=${BACKUP_DIR} Year=${YEAR} Month=${MONTH} Batch=${BATCH}"
-
-mkdir -p "${BACKUP_DIR}" || error_exit "Cannot create staging dir ${BACKUP_DIR}"
-
-# Make archive
-HOST_SAFE=$(hostname -s | tr ' ' '_' | tr '/' '_' )
-TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-ARCHIVE_NAME="backup-${HOST_SAFE}-${TIMESTAMP}.tar.gz"
-ARCHIVE_PATH="${BACKUP_DIR}/${ARCHIVE_NAME}"
-
-log "Creating compressed archive of ${BACKUP_SOURCE}..."
-if command -v realpath >/dev/null 2>&1; then
-  REL=$(realpath --relative-to=/ "${BACKUP_SOURCE}" 2>/dev/null || true)
-  if [ -n "${RELPATH:-}" ]; then
-    tar --preserve-permissions -czpf "${ARCHIVE_PATH}" -C / "${REL}"
-  else
-    tar -czpf "${ARCHIVE_PATH}" -C "$(dirname "${BACKUP_SOURCE}")" "$(basename "${BACKUP_SOURCE}")"
-  fi
-else
-  tar -czpf "${ARCHIVE_PATH}" -C "$(dirname "${BACKUP_SOURCE}")" "$(basename "${BACKUP_SOURCE}")"
-fi
-log "Archive created: ${ARCHIVE_PATH}"
-
-ARCHIVE_SHA256=$(sha256sum "${ARCHIVE_PATH}" | awk '{print $1}')
-log "Local SHA256: ${ARCHIVE_SHA256}"
-
-# Check / create bucket
-log "Checking S3 bucket: ${S3_BUCKET}"
-set +e
-aws_run s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1
-HEAD_EXIT=$?
-set -e
-
-if [ "${HEAD_EXIT}" -ne 0 ]; then
-  warn "Bucket not found or inaccessible."
-  read -rp "Create bucket ${S3_BUCKET} in ${REGION}? (yes/no) [default: yes]: " CREATE_CHOICE
-  CREATE_CHOICE=${CREATE_CHOICE:-yes}
-  if [[ "${CREATE_CHOICE,,}" =~ ^(y|yes)$ ]]; then
-    if [ "${REGION}" = "us-east-1" ]; then
-      aws_run s3api create-bucket --bucket "${S3_BUCKET}" || error_exit "Bucket creation failed"
-    else
-      aws_run s3api create-bucket --bucket "${S3_BUCKET}" --create-bucket-configuration "LocationConstraint=${REGION}" || error_exit "Bucket creation failed"
-    fi
-    log "Bucket created: ${S3_BUCKET}"
-    aws_run s3api put-bucket-versioning --bucket "${S3_BUCKET}" --versioning-configuration Status=Enabled >/dev/null 2>&1 || warn "versioning failed"
-    aws_run s3api put-bucket-encryption --bucket "${S3_BUCKET}" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null 2>&1 || warn "encryption failed"
-  else
-    error_exit "Bucket required. Aborting."
-  fi
-else
-  log "Bucket exists."
-fi
-
-# Build the nested prefix list (with month included)
-# sales/<YEAR>/<MONTH>/<BATCH>/project/
-# inventory/<YEAR>/<MONTH>/<BATCH>/component/
-# workshop/<YEAR>/<MONTH>/<BATCH>/project/
-# backup/uploads/
-# backup/db/
-PREFIXES=(
-  "sales/${YEAR}/${MONTH}/${BATCH}/project/"
-  "inventory/${YEAR}/${MONTH}/${BATCH}/component/"
-  "workshop/${YEAR}/${MONTH}/${BATCH}/project/"
-  "backup/uploads/"
-  "backup/db/"
-)
-
-# Seed S3 prefixes with README and create matching local folders
-for p in "${PREFIXES[@]}"; do
-  # remove trailing slash for local path creation
-  p_noslash="${p%/}"
-  localdir="${BACKUP_DIR}/${p_noslash}"
-  mkdir -p "${localdir}" || warn "Could not create ${localdir}"
-  echo "Seed file for ${p_noslash} created at $(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "${localdir}/.seed"
-
-  # create a temp file to upload as README
-  tmpfile=$(mktemp)
-  TMP_CLEANUP="${tmpfile}"
-  cat > "${tmpfile}" <<EOF
-This seeds the prefix '${p}' in bucket ${S3_BUCKET}
-Created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-EOF
-
-  # upload README to S3 to ensure prefix exists
-  set +e
-  aws_run s3api put-object --bucket "${S3_BUCKET}" --key "${p}README.txt" --body "${tmpfile}" >/dev/null 2>&1
-  PUT_EXIT=$?
-  set -e
-  rm -f "${tmpfile}"
-  TMP_CLEANUP=""
-
-  if [ $PUT_EXIT -ne 0 ]; then
-    warn "Failed to seed s3://${S3_BUCKET}/${p}README.txt"
-  else
-    log "Seeded s3://${S3_BUCKET}/${p}README.txt and prepared local ${localdir}"
-  fi
-done
-
-# Upload archive
-DEST_KEY="${ARCHIVE_NAME}"  # root by default
-read -rp "Optional archive prefix inside bucket (e.g. backups) [leave empty to store at bucket root]: " ARCHIVE_PREFIX
-if [ -n "${ARCHIVE_PREFIX}" ]; then
-  DEST_KEY="${ARCHIVE_PREFIX%/}/${ARCHIVE_NAME}"
-fi
-
-log "Ready to upload archive to s3://${S3_BUCKET}/${DEST_KEY}"
-read -rp "Proceed with upload? (yes/no) [default: yes]: " PROCEED_UPLOAD
-PROCEED_UPLOAD=${PROCEED_UPLOAD:-yes}
-if [[ ! "${PROCEED_UPLOAD,,}" =~ ^(y|yes)$ ]]; then
-  warn "Upload cancelled by user. Archive left at ${ARCHIVE_PATH}"
+# Convert CRLF to LF if script was edited on Windows (safe no-op if already LF)
+if grep -q $'\r' "$0"; then
+  echo "Converting CRLF -> LF in this script..."
+  tmpf="$(mktemp)"
+  tr -d '\r' < "$0" > "$tmpf"
+  cat "$tmpf" > "$0"
+  rm -f "$tmpf"
+  echo "Converted script line endings. Re-run the script now."
   exit 0
 fi
 
-upload_attempt=0
-UP_EXIT=1
-BACKOFF=2
-while [ $upload_attempt -lt "${MAX_UPLOAD_RETRIES}" ]; do
-  upload_attempt=$((upload_attempt+1))
-  log "Upload attempt ${upload_attempt}..."
-  set +e
-  aws_run s3 cp "${ARCHIVE_PATH}" "s3://${S3_BUCKET}/${DEST_KEY}"
-  UP_EXIT=$?
-  set -e
-  if [ $UP_EXIT -eq 0 ]; then
-    log "Upload finished. Trying checksum verification..."
-    set +e
-    REMOTE_CHECKSUM=$(aws_run s3api head-object --bucket "${S3_BUCKET}" --key "${DEST_KEY}" --query 'ChecksumSHA256' --output text 2>/dev/null || true)
-    set -e
-    if [ -n "${REMOTE_CHECKSUM}" ] && [ "${REMOTE_CHECKSUM}" != "None" ]; then
-      if [ "${REMOTE_CHECKSUM}" = "${ARCHIVE_SHA256}" ]; then
-        log "Checksum verified."
-        UP_EXIT=0
-        break
-      else
-        warn "Remote checksum mismatch."
-        UP_EXIT=1
-      fi
-    else
-      # fallback: best-effort acceptance for multipart / ETag cases
-      log "Remote checksum not available; proceeding but please verify if strict checksum required."
-      UP_EXIT=0
-      break
-    fi
+# Build AWS CLI base command as an array to avoid accidental single-string commands
+AWS_CLI=(aws --region "${REGION}")
+if [ -n "${AWS_PROFILE}" ]; then
+  AWS_CLI+=(--profile "${AWS_PROFILE}")
+fi
+
+# helper to run aws commands
+aws_run() {
+  "${AWS_CLI[@]}" "$@"
+}
+
+# Requirements check
+if ! command -v aws >/dev/null 2>&1; then
+  echo "ERROR: aws CLI not found. Install & configure AWS CLI v2 and retry."
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ERROR: jq not found. Install jq and retry."
+  exit 1
+fi
+
+echo "Using AWS region: ${REGION}"
+echo "S3 bucket name: ${BUCKET_NAME}"
+echo "IAM role name: ${IAM_ROLE_NAME}"
+echo
+
+# 0) Find latest Amazon Linux 2 AMI (owner 137112412989 is Amazon)
+echo "0) Finding latest Amazon Linux 2 AMI in ${REGION}..."
+AMI_ID=$(aws_run ec2 describe-images \
+  --owners 137112412989 \
+  --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
+  --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+  --output text)
+
+if [ -z "${AMI_ID}" ] || [ "${AMI_ID}" = "None" ]; then
+  echo "ERROR: Could not find Amazon Linux 2 AMI automatically. Please set AMI_ID manually."
+  exit 1
+fi
+echo "Selected AMI: ${AMI_ID}"
+echo
+
+# 1) Create S3 bucket (special-case for us-east-1)
+echo "1) Creating S3 bucket: ${BUCKET_NAME} ..."
+if aws_run s3api head-bucket --bucket "${BUCKET_NAME}" 2>/dev/null; then
+  echo "Bucket exists and accessible."
+else
+  if [ "${REGION}" = "us-east-1" ]; then
+    aws_run s3api create-bucket --bucket "${BUCKET_NAME}"
+  else
+    aws_run s3api create-bucket --bucket "${BUCKET_NAME}" --create-bucket-configuration LocationConstraint="${REGION}"
   fi
 
-  warn "Attempt ${upload_attempt} failed (exit ${UP_EXIT}). Sleeping ${BACKOFF}s..."
-  sleep "${BACKOFF}"
-  BACKOFF=$((BACKOFF * 2))
+  aws_run s3api put-bucket-versioning --bucket "${BUCKET_NAME}" --versioning-configuration Status=Enabled
+
+  tmp_enc=$(mktemp)
+  cat > "${tmp_enc}" <<'EJSON'
+{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}
+EJSON
+  aws_run s3api put-bucket-encryption --bucket "${BUCKET_NAME}" --server-side-encryption-configuration file://"${tmp_enc}"
+  rm -f "${tmp_enc}"
+  echo "Bucket created: versioning + default encryption enabled."
+
+  # --- New: create S3 prefixes (folders) and seed them with a small README object ---
+  echo "Seeding S3 prefixes: ${S3_PREFIXES[*]}"
+  for prefix in "${S3_PREFIXES[@]}"; do
+    # Create a small readme locally, upload as object to create the folder in S3
+    tmp_readme="$(mktemp)"
+    cat > "${tmp_readme}" <<EOF
+This object seeds the '${prefix}/' prefix in bucket ${BUCKET_NAME}.
+Created at $(date -u +"%Y-%m-%dT%H:%M:%SZ").
+EOF
+    aws_run s3api put-object --bucket "${BUCKET_NAME}" --key "${prefix}/README.txt" --body "${tmp_readme}" >/dev/null
+    rm -f "${tmp_readme}"
+    echo "Created s3://${BUCKET_NAME}/${prefix}/README.txt"
+  done
+  # --- end seeding ---
+fi
+echo
+
+# 2) Create IAM role (EC2 assume-role) + inline policy
+echo "2) Creating IAM role and inline policy..."
+TRUST_FILE=$(mktemp)
+cat > "${TRUST_FILE}" <<'JSON'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect":"Allow",
+      "Principal":{"Service":"ec2.amazonaws.com"},
+      "Action":"sts:AssumeRole"
+    }
+  ]
+}
+JSON
+
+set +e
+ROLE_CREATE_OUT=$(aws_run iam create-role --role-name "${IAM_ROLE_NAME}" --assume-role-policy-document "file://${TRUST_FILE}" 2>/dev/null || true)
+set -e
+
+if [ -n "${ROLE_CREATE_OUT}" ]; then
+  ROLE_ARN=$(echo "${ROLE_CREATE_OUT}" | jq -r '.Role.Arn')
+else
+  ROLE_ARN=$(aws_run iam get-role --role-name "${IAM_ROLE_NAME}" --query 'Role.Arn' --output text)
+fi
+rm -f "${TRUST_FILE}"
+echo "Role ARN: ${ROLE_ARN}"
+
+POLICY_FILE=$(mktemp)
+cat > "${POLICY_FILE}" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect":"Allow",
+      "Action":[
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:DeleteObject",
+        "s3:PutObjectAcl"
+      ],
+      "Resource":[
+        "arn:aws:s3:::${BUCKET_NAME}",
+        "arn:aws:s3:::${BUCKET_NAME}/*"
+      ]
+    },
+    {
+      "Effect":"Allow",
+      "Action":[
+        "ec2:CreateSnapshot",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeVolumes",
+        "ec2:CreateTags",
+        "ec2:DescribeInstances"
+      ],
+      "Resource":"*"
+    },
+    {
+      "Effect":"Allow",
+      "Action":[
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource":"*"
+    }
+  ]
+}
+EOF
+
+aws_run iam put-role-policy --role-name "${IAM_ROLE_NAME}" --policy-name "${IAM_ROLE_NAME}-policy" --policy-document file://"${POLICY_FILE}"
+rm -f "${POLICY_FILE}"
+echo "Inline policy attached."
+echo
+
+# 3) Create instance profile and attach role
+echo "3) Creating instance profile and attaching role..."
+set +e
+aws_run iam create-instance-profile --instance-profile-name "${INSTANCE_PROFILE_NAME}" >/dev/null 2>&1 || true
+aws_run iam add-role-to-instance-profile --instance-profile-name "${INSTANCE_PROFILE_NAME}" --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1 || true
+set -e
+echo "Instance profile ready: ${INSTANCE_PROFILE_NAME}"
+echo
+
+# Wait for IAM propagation
+echo "Waiting 10 seconds for IAM propagation..."
+sleep 10
+echo
+
+# 4) Create Security Group
+echo "4) Creating security group: ${SEC_GROUP_NAME} ..."
+VPC_ID=$(aws_run ec2 describe-vpcs --query 'Vpcs[0].VpcId' --output text)
+if [ -z "${VPC_ID}" ] || [ "${VPC_ID}" = "None" ]; then
+  echo "ERROR: Could not determine VPC ID in ${REGION}."
+  exit 1
+fi
+
+SG_ID=$(aws_run ec2 create-security-group --group-name "${SEC_GROUP_NAME}" --description "SG for EC2 backup instance" --vpc-id "${VPC_ID}" --query 'GroupId' --output text)
+# allow SSH (production: lock down CIDR)
+aws_run ec2 authorize-security-group-ingress --group-id "${SG_ID}" --protocol tcp --port 22 --cidr 0.0.0.0/0 || true
+echo "Security group created: ${SG_ID}"
+echo
+
+# 5) Create or import key pair
+echo "5) Preparing key pair: ${KEY_NAME} ..."
+if [ ! -f "${KEY_NAME}.pem" ]; then
+  echo "Creating key pair in AWS and saving ${KEY_NAME}.pem locally..."
+  aws_run ec2 create-key-pair --key-name "${KEY_NAME}" --query 'KeyMaterial' --output text > "${KEY_NAME}.pem"
+  chmod 600 "${KEY_NAME}.pem"
+  echo "Saved ${KEY_NAME}.pem"
+else
+  echo "Local ${KEY_NAME}.pem exists."
+  if ! aws_run ec2 describe-key-pairs --key-names "${KEY_NAME}" >/dev/null 2>&1; then
+    PUBKEY=$(ssh-keygen -y -f "${KEY_NAME}.pem")
+    aws_run ec2 import-key-pair --key-name "${KEY_NAME}" --public-key-material "${PUBKEY}"
+    echo "Imported public key to AWS as ${KEY_NAME}."
+  else
+    echo "Key pair exists in AWS."
+  fi
+fi
+echo
+
+# 6) Prepare user-data (backup script)
+USER_DATA_FILE=$(mktemp)
+cat > "${USER_DATA_FILE}" <<'EOF'
+#!/bin/bash
+set -e
+exec > /var/log/user-data.log 2>&1
+
+# Install awscli, tar, jq
+if command -v yum >/dev/null 2>&1; then
+  yum update -y
+  yum install -y awscli jq tar gzip
+elif command -v apt-get >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y awscli jq tar gzip
+fi
+
+BACKUP_DIR="/backup"
+mkdir -p "${BACKUP_DIR}"
+chown ec2-user:ec2-user "${BACKUP_DIR}" 2>/dev/null || true
+chmod 700 "${BACKUP_DIR}"
+
+# Create the application-specific folders under /backup so they get synced to S3
+for sub in sales inventory workshop backup; do
+  mkdir -p "${BACKUP_DIR}/${sub}"
+  # ensure there's at least one file so aws s3 sync uploads the folder
+  echo "Seed file for ${sub} created at $(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "${BACKUP_DIR}/${sub}/.seed"
+  chown -R ec2-user:ec2-user "${BACKUP_DIR}/${sub}" 2>/dev/null || true
 done
 
-if [ $UP_EXIT -ne 0 ]; then
-  error_exit "Upload failed after ${MAX_UPLOAD_RETRIES} attempts. Archive at ${ARCHIVE_PATH}"
-fi
-log "Upload succeeded: s3://${S3_BUCKET}/${DEST_KEY}"
+BUCKET="__BUCKET__"
+HOSTNAME="$(hostname -s)"
+INSTANCE_ID="$(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+TIMESTAMP="$(date +%F-%H%M%S)"
+ARCHIVE="${BACKUP_DIR}/${HOSTNAME}-fs-backup-${TIMESTAMP}.tar.gz"
 
-# Optionally remove local archive
-if [[ "${REMOVE_LOCAL,,}" =~ ^(y|yes)$ ]]; then
-  rm -f "${ARCHIVE_PATH}" && log "Removed ${ARCHIVE_PATH}"
-fi
+# Create filesystem archive (exclude virtual filesystems and backup dir)
+tar --exclude=/proc --exclude=/sys --exclude=/dev --exclude=${BACKUP_DIR} --exclude=/tmp --exclude=/run --exclude=/mnt --exclude=/var/tmp -czpf "${ARCHIVE}" /
 
-# Sync seeded local folders to their S3 prefixes (so local .seed files are uploaded)
-if [[ "${SYNC_SEEDED,,}" =~ ^(y|yes)$ ]]; then
-  for p in "${PREFIXES[@]}"; do
-    p_noslash="${p%/}"
-    localdir="${BACKUP_DIR}/${p_noslash}"
-    s3dest="${p}"
-    log "Syncing ${localdir}/ -> s3://${S3_BUCKET}/${s3dest}"
-    set +e
-    aws_run s3 sync "${localdir}/" "s3://${S3_BUCKET}/${s3dest}" --exact-timestamps
-    SYNC_EXIT=$?
-    set -e
-    if [ $SYNC_EXIT -ne 0 ]; then
-      warn "Sync failed for ${localdir} (exit ${SYNC_EXIT})."
-    else
-      log "Synced ${localdir} -> s3://${S3_BUCKET}/${s3dest}"
-    fi
+CREATE_SNAPSHOTS="__CREATE_SNAPSHOTS__"
+if [ "${CREATE_SNAPSHOTS}" = "yes" ]; then
+  INSTANCE_JSON="$(aws ec2 describe-instances --instance-ids ${INSTANCE_ID})"
+  VOL_IDS=$(echo "${INSTANCE_JSON}" | jq -r '.Reservations[].Instances[].BlockDeviceMappings[].Ebs.VolumeId')
+  for vol in ${VOL_IDS}; do
+    SNAP_DESC="Auto snapshot of ${vol} from ${INSTANCE_ID} at ${TIMESTAMP}"
+    SNAP_ID=$(aws ec2 create-snapshot --volume-id "${vol}" --description "${SNAP_DESC}" --query SnapshotId --output text)
+    aws ec2 create-tags --resources "${SNAP_ID}" --tags Key=Name,Value="${HOSTNAME}-snapshot" Key=Backup,Value="__SNAP_TAG__"
   done
 fi
 
-# cleanup old archives
-log "Removing local archives older than ${RETENTION_DAYS} days in ${BACKUP_DIR}..."
-find "${BACKUP_DIR}" -type f -name "backup-*.tar.gz" -mtime +"${RETENTION_DAYS}" -print -exec rm -f {} \; || warn "Cleanup returned non-zero"
+# Sync to S3 (this will upload /backup and the seeded sales/inventory/workshop folders)
+aws s3 sync "${BACKUP_DIR}/" "s3://${BUCKET}/${HOSTNAME}/"
 
-log "Done. Main archive: s3://${S3_BUCKET}/${DEST_KEY}"
-exit 0
+# Keep last 7 archives locally
+ls -1t ${BACKUP_DIR}/*fs-backup-*.tar.gz 2>/dev/null | sed -e '1,7d' | xargs -r rm --
+EOF
+
+# replace placeholders in user-data
+sed -e "s|__BUCKET__|${BUCKET_NAME}|g" \
+    -e "s|__CREATE_SNAPSHOTS__|${CREATE_SNAPSHOTS}|g" \
+    -e "s|__SNAP_TAG__|${SNAPSHOT_TAG}|g" "${USER_DATA_FILE}" > "${USER_DATA_FILE}.final"
+
+# 7) Launch EC2
+echo "6) Launching EC2 instance..."
+INSTANCE_JSON=$(aws_run ec2 run-instances \
+  --image-id "${AMI_ID}" \
+  --instance-type "${INSTANCE_TYPE}" \
+  --key-name "${KEY_NAME}" \
+  --security-group-ids "${SG_ID}" \
+  --iam-instance-profile Name="${INSTANCE_PROFILE_NAME}" \
+  --user-data file://"${USER_DATA_FILE}.final" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" \
+  --query 'Instances[0]' \
+  --output json)
+
+INSTANCE_ID=$(echo "${INSTANCE_JSON}" | jq -r '.InstanceId')
+PUBLIC_IP=$(echo "${INSTANCE_JSON}" | jq -r '.PublicIpAddress // "N/A"')
+PRIVATE_IP=$(echo "${INSTANCE_JSON}" | jq -r '.PrivateIpAddress')
+
+echo
+echo "=== SUCCESS ==="
+echo "Instance ID : ${INSTANCE_ID}"
+echo "Public IP   : ${PUBLIC_IP}"
+echo "Private IP  : ${PRIVATE_IP}"
+echo "S3 Bucket   : ${BUCKET_NAME}"
+echo "IAM Role    : ${IAM_ROLE_NAME}"
+echo
+if [ "${PUBLIC_IP}" != "N/A" ]; then
+  echo "SSH command: ssh -i ${KEY_NAME}.pem ec2-user@${PUBLIC_IP}"
+else
+  echo "No public IP assigned. Use Session Manager or a public subnet."
+fi
+
+# Cleanup
+rm -f "${USER_DATA_FILE}" "${USER_DATA_FILE}.final"
+
+echo
+echo "Notes:"
+echo "- Restrict SSH ingress (0.0.0.0/0 used here for brevity)."
+echo "- For production consider using managed policies and AWS Backup for snapshot lifecycle."
+echo "- Created S3 prefixes: ${S3_PREFIXES[*]} and seeded them with README.txt objects."
