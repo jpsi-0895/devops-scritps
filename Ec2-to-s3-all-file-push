@@ -3,136 +3,298 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ========================================
-#   EC2 → S3 Backup Script (Fully Interactive)
+#   EC2 → S3 Backup Script (Interactive, nested prefixes with Year+Month)
 # ========================================
 
-# ===== USER INPUT =====
-echo "Enter AWS Region [default: us-east-1]: "
-read -r USER_REGION
-REGION="${USER_REGION:-us-east-1}"  # default to us-east-1 if empty
+# ===== Defaults (change if you like) =====
+DEFAULT_REGION="us-east-1"
+DEFAULT_BACKUP_SOURCE="/home/ec2-user"
+DEFAULT_BACKUP_DIR="/tmp/ec2-backups"
+DEFAULT_RETENTION_DAYS=7
+DEFAULT_MAX_UPLOAD_RETRIES=5
+LOGFILE="${HOME}/ec2-s3-backup.log"
+# =========================================
 
-# Ask for bucket name (required)
-while true; do
-  read -rp "Enter S3 Bucket Name (required): " S3_BUCKET
-  if [ -n "${S3_BUCKET}" ]; then
-    break
-  else
-    echo "Bucket name cannot be empty. Please enter a valid name."
-  fi
+# helpers
+log() { printf "[%s] %b\n" "$(date +'%F %T')" "$*"; echo "[INFO] $(date +'%F %T') $*" >> "${LOGFILE}"; }
+warn() { printf "[%s] WARNING: %b\n" "$(date +'%F %T')" "$*" >&2; echo "[WARN] $(date +'%F %T') $*" >> "${LOGFILE}"; }
+error_exit() { printf "[%s] ERROR: %b\n" "$(date +'%F %T')" "$*" >&2; echo "[ERROR] $(date +'%F %T') $*" >> "${LOGFILE}"; exit 1; }
+
+# ensure log file exists
+touch "${LOGFILE}" 2>/dev/null || { echo "Cannot write log to ${LOGFILE}. Using /tmp/ec2-s3-backup.log"; LOGFILE="/tmp/ec2-s3-backup.log"; touch "${LOGFILE}"; }
+
+trap 'rm -f "${TMP_CLEANUP:-}" >/dev/null 2>&1 || true' EXIT
+
+# pre-checks
+command -v aws >/dev/null 2>&1 || error_exit "AWS CLI not found."
+command -v tar >/dev/null 2>&1 || error_exit "tar not found."
+
+# -------------------------
+# Interactive inputs
+# -------------------------
+read -rp "AWS profile to use (leave empty for default): " AWS_PROFILE
+AWS_PROFILE="${AWS_PROFILE:-}"
+
+read -rp "AWS region [${DEFAULT_REGION}]: " USER_REGION
+REGION="${USER_REGION:-${DEFAULT_REGION}}"
+
+while :; do
+  read -rp "S3 Bucket name (required): " S3_BUCKET
+  [ -n "${S3_BUCKET}" ] && break
+  echo "Bucket name cannot be empty."
 done
 
-# ===== CONFIG =====
-BACKUP_SOURCE="/home/ec2-user"        # directory to back up
-BACKUP_DIR="/tmp/ec2-backups"         # local staging dir
-RETENTION_DAYS=7                      # remove local archives older than this
-MAX_UPLOAD_RETRIES=3
-S3_PREFIX=""                           # optional prefix inside bucket (e.g., "backups")
-# ==================
+read -rp "Local directory to back up [${DEFAULT_BACKUP_SOURCE}]: " BACKUP_SOURCE
+BACKUP_SOURCE="${BACKUP_SOURCE:-${DEFAULT_BACKUP_SOURCE}}"
 
-log() { echo -e "[\e[32m$(date +'%F %T')\e[0m] $*"; }
-warn() { echo -e "[\e[33mWARNING\e[0m] $*"; }
-error_exit() { echo -e "[\e[31mERROR\e[0m] $*" >&2; exit 1; }
+read -rp "Local staging dir [${DEFAULT_BACKUP_DIR}]: " BACKUP_DIR
+BACKUP_DIR="${BACKUP_DIR:-${DEFAULT_BACKUP_DIR}}"
 
-# ===== PRE-CHECKS =====
-if ! command -v aws >/dev/null 2>&1; then
-  error_exit "AWS CLI not installed. Please install and configure or attach an IAM role."
+read -rp "Retention days for local archives [${DEFAULT_RETENTION_DAYS}]: " RETENTION_DAYS
+RETENTION_DAYS="${RETENTION_DAYS:-${DEFAULT_RETENTION_DAYS}}"
+
+read -rp "Max upload retries [${DEFAULT_MAX_UPLOAD_RETRIES}]: " MAX_UPLOAD_RETRIES
+MAX_UPLOAD_RETRIES="${MAX_UPLOAD_RETRIES:-${DEFAULT_MAX_UPLOAD_RETRIES}}"
+
+# These values are inferred from the image you provided:
+read -rp "Year for folder structure [default: current year]: " YEAR_IN
+YEAR="${YEAR_IN:-$(date +%Y)}"
+
+# NEW: Month option (two-digit by default)
+read -rp "Month for folder structure [default: current month (01-12)]: " MONTH_IN
+# normalize month to two digits
+if [ -z "${MONTH_IN}" ]; then
+  MONTH="$(date +%m)"
+else
+  # allow user to enter number or name; try to normalize
+  case "${MONTH_IN}" in
+    1|01) MONTH="01";;
+    2|02) MONTH="02";;
+    3|03) MONTH="03";;
+    4|04) MONTH="04";;
+    5|05) MONTH="05";;
+    6|06) MONTH="06";;
+    7|07) MONTH="07";;
+    8|08) MONTH="08";;
+    9|09) MONTH="09";;
+    10) MONTH="10";;
+    11) MONTH="11";;
+    12) MONTH="12";;
+    Jan|jan|JAN) MONTH="01";;
+    Feb|feb|FEB) MONTH="02";;
+    Mar|mar|MAR) MONTH="03";;
+    Apr|apr|APR) MONTH="04";;
+    May|may|MAY) MONTH="05";;
+    Jun|jun|JUN) MONTH="06";;
+    Jul|jul|JUL) MONTH="07";;
+    Aug|aug|AUG) MONTH="08";;
+    Sep|sep|SEP|Sept|sept|SEPT) MONTH="09";;
+    Oct|oct|OCT) MONTH="10";;
+    Nov|nov|NOV) MONTH="11";;
+    Dec|dec|DEC) MONTH="12";;
+    *) 
+      echo "Invalid month input. Defaulting to current month."
+      MONTH="$(date +%m)"
+      ;;
+  esac
 fi
-if ! command -v tar >/dev/null 2>&1; then
-  error_exit "tar command not found."
-fi
-if ! command -v jq >/dev/null 2>&1; then
-  warn "jq not found (optional)."
-fi
 
-mkdir -p "${BACKUP_DIR}"
+read -rp "Batch / identifier (image showed '112') [default: 112]: " BATCH_IN
+BATCH="${BATCH_IN:-112}"
 
-# ===== PREPARE BACKUP =====
+read -rp "Remove local archive after upload? (yes/no) [default: no]: " REMOVE_LOCAL
+REMOVE_LOCAL="${REMOVE_LOCAL:-no}"
+
+read -rp "Also sync seeded folders to S3? (yes/no) [default: yes]: " SYNC_SEEDED
+SYNC_SEEDED="${SYNC_SEEDED:-yes}"
+
+# Build AWS CLI base
+AWS_CLI=(aws --region "${REGION}")
+if [ -n "${AWS_PROFILE}" ]; then AWS_CLI+=(--profile "${AWS_PROFILE}"); fi
+aws_run() { "${AWS_CLI[@]}" "$@"; }
+
+log "Starting. Bucket=${S3_BUCKET} Region=${REGION} Source=${BACKUP_SOURCE} Staging=${BACKUP_DIR} Year=${YEAR} Month=${MONTH} Batch=${BATCH}"
+
+mkdir -p "${BACKUP_DIR}" || error_exit "Cannot create staging dir ${BACKUP_DIR}"
+
+# Make archive
 HOST_SAFE=$(hostname -s | tr ' ' '_' | tr '/' '_' )
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 ARCHIVE_NAME="backup-${HOST_SAFE}-${TIMESTAMP}.tar.gz"
 ARCHIVE_PATH="${BACKUP_DIR}/${ARCHIVE_NAME}"
 
 log "Creating compressed archive of ${BACKUP_SOURCE}..."
-tar --preserve-permissions -czpf "${ARCHIVE_PATH}" -C / $(realpath --relative-to=/ "${BACKUP_SOURCE}") 2>/dev/null || {
-  tar -czpf "${ARCHIVE_PATH}" "${BACKUP_SOURCE}"
-}
-log "Archive created at ${ARCHIVE_PATH}"
+if command -v realpath >/dev/null 2>&1; then
+  REL=$(realpath --relative-to=/ "${BACKUP_SOURCE}" 2>/dev/null || true)
+  if [ -n "${RELPATH:-}" ]; then
+    tar --preserve-permissions -czpf "${ARCHIVE_PATH}" -C / "${REL}"
+  else
+    tar -czpf "${ARCHIVE_PATH}" -C "$(dirname "${BACKUP_SOURCE}")" "$(basename "${BACKUP_SOURCE}")"
+  fi
+else
+  tar -czpf "${ARCHIVE_PATH}" -C "$(dirname "${BACKUP_SOURCE}")" "$(basename "${BACKUP_SOURCE}")"
+fi
+log "Archive created: ${ARCHIVE_PATH}"
 
-# ===== BUCKET VALIDATION =====
-log "Verifying S3 bucket: ${S3_BUCKET} (region ${REGION})..."
+ARCHIVE_SHA256=$(sha256sum "${ARCHIVE_PATH}" | awk '{print $1}')
+log "Local SHA256: ${ARCHIVE_SHA256}"
+
+# Check / create bucket
+log "Checking S3 bucket: ${S3_BUCKET}"
 set +e
-aws --region "${REGION}" s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1
+aws_run s3api head-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1
 HEAD_EXIT=$?
 set -e
 
 if [ "${HEAD_EXIT}" -ne 0 ]; then
-  warn "Bucket ${S3_BUCKET} not found or not accessible."
-  read -rp "Do you want to create this bucket in region ${REGION}? (yes/no) [default: yes]: " CREATE_CHOICE
+  warn "Bucket not found or inaccessible."
+  read -rp "Create bucket ${S3_BUCKET} in ${REGION}? (yes/no) [default: yes]: " CREATE_CHOICE
   CREATE_CHOICE=${CREATE_CHOICE:-yes}
-
   if [[ "${CREATE_CHOICE,,}" =~ ^(y|yes)$ ]]; then
-    log "Creating bucket ${S3_BUCKET} ..."
     if [ "${REGION}" = "us-east-1" ]; then
-      aws --region "${REGION}" s3api create-bucket --bucket "${S3_BUCKET}" >/dev/null 2>&1 || error_exit "Bucket creation failed."
+      aws_run s3api create-bucket --bucket "${S3_BUCKET}" || error_exit "Bucket creation failed"
     else
-      aws --region "${REGION}" s3api create-bucket \
-        --bucket "${S3_BUCKET}" \
-        --create-bucket-configuration LocationConstraint="${REGION}" >/dev/null 2>&1 || error_exit "Bucket creation failed."
+      aws_run s3api create-bucket --bucket "${S3_BUCKET}" --create-bucket-configuration "LocationConstraint=${REGION}" || error_exit "Bucket creation failed"
     fi
-
-    log "Bucket created successfully."
-    aws --region "${REGION}" s3api put-bucket-versioning \
-      --bucket "${S3_BUCKET}" --versioning-configuration Status=Enabled >/dev/null 2>&1 || warn "Failed to enable versioning."
-    aws --region "${REGION}" s3api put-bucket-encryption \
-      --bucket "${S3_BUCKET}" \
-      --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null 2>&1 || warn "Failed to enable encryption."
+    log "Bucket created: ${S3_BUCKET}"
+    aws_run s3api put-bucket-versioning --bucket "${S3_BUCKET}" --versioning-configuration Status=Enabled >/dev/null 2>&1 || warn "versioning failed"
+    aws_run s3api put-bucket-encryption --bucket "${S3_BUCKET}" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null 2>&1 || warn "encryption failed"
   else
-    error_exit "Bucket not found. Aborting backup."
+    error_exit "Bucket required. Aborting."
   fi
 else
-  log "Bucket exists and is accessible."
+  log "Bucket exists."
 fi
 
-# ===== UPLOAD =====
-if [ -n "${S3_PREFIX}" ]; then
-  DEST_KEY="${S3_PREFIX%/}/${ARCHIVE_NAME}"
-else
-  DEST_KEY="${ARCHIVE_NAME}"
+# Build the nested prefix list (with month included)
+# sales/<YEAR>/<MONTH>/<BATCH>/project/
+# inventory/<YEAR>/<MONTH>/<BATCH>/component/
+# workshop/<YEAR>/<MONTH>/<BATCH>/project/
+# backup/uploads/
+# backup/db/
+PREFIXES=(
+  "sales/${YEAR}/${MONTH}/${BATCH}/project/"
+  "inventory/${YEAR}/${MONTH}/${BATCH}/component/"
+  "workshop/${YEAR}/${MONTH}/${BATCH}/project/"
+  "backup/uploads/"
+  "backup/db/"
+)
+
+# Seed S3 prefixes with README and create matching local folders
+for p in "${PREFIXES[@]}"; do
+  # remove trailing slash for local path creation
+  p_noslash="${p%/}"
+  localdir="${BACKUP_DIR}/${p_noslash}"
+  mkdir -p "${localdir}" || warn "Could not create ${localdir}"
+  echo "Seed file for ${p_noslash} created at $(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "${localdir}/.seed"
+
+  # create a temp file to upload as README
+  tmpfile=$(mktemp)
+  TMP_CLEANUP="${tmpfile}"
+  cat > "${tmpfile}" <<EOF
+This seeds the prefix '${p}' in bucket ${S3_BUCKET}
+Created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EOF
+
+  # upload README to S3 to ensure prefix exists
+  set +e
+  aws_run s3api put-object --bucket "${S3_BUCKET}" --key "${p}README.txt" --body "${tmpfile}" >/dev/null 2>&1
+  PUT_EXIT=$?
+  set -e
+  rm -f "${tmpfile}"
+  TMP_CLEANUP=""
+
+  if [ $PUT_EXIT -ne 0 ]; then
+    warn "Failed to seed s3://${S3_BUCKET}/${p}README.txt"
+  else
+    log "Seeded s3://${S3_BUCKET}/${p}README.txt and prepared local ${localdir}"
+  fi
+done
+
+# Upload archive
+DEST_KEY="${ARCHIVE_NAME}"  # root by default
+read -rp "Optional archive prefix inside bucket (e.g. backups) [leave empty to store at bucket root]: " ARCHIVE_PREFIX
+if [ -n "${ARCHIVE_PREFIX}" ]; then
+  DEST_KEY="${ARCHIVE_PREFIX%/}/${ARCHIVE_NAME}"
 fi
 
-log "Backup ready to upload to s3://${S3_BUCKET}/${DEST_KEY}"
-read -rp "Proceed with upload? (yes/no) [default: yes]: " CONFIRM_UPLOAD
-CONFIRM_UPLOAD=${CONFIRM_UPLOAD:-yes}
-if [[ ! "${CONFIRM_UPLOAD,,}" =~ ^(y|yes)$ ]]; then
-  warn "Upload canceled by user."
+log "Ready to upload archive to s3://${S3_BUCKET}/${DEST_KEY}"
+read -rp "Proceed with upload? (yes/no) [default: yes]: " PROCEED_UPLOAD
+PROCEED_UPLOAD=${PROCEED_UPLOAD:-yes}
+if [[ ! "${PROCEED_UPLOAD,,}" =~ ^(y|yes)$ ]]; then
+  warn "Upload cancelled by user. Archive left at ${ARCHIVE_PATH}"
   exit 0
 fi
 
 upload_attempt=0
-while [ $upload_attempt -lt $MAX_UPLOAD_RETRIES ]; do
+UP_EXIT=1
+BACKOFF=2
+while [ $upload_attempt -lt "${MAX_UPLOAD_RETRIES}" ]; do
   upload_attempt=$((upload_attempt+1))
-  log "Uploading (attempt ${upload_attempt}) ..."
+  log "Upload attempt ${upload_attempt}..."
   set +e
-  aws --region "${REGION}" s3 cp "${ARCHIVE_PATH}" "s3://${S3_BUCKET}/${DEST_KEY}"
+  aws_run s3 cp "${ARCHIVE_PATH}" "s3://${S3_BUCKET}/${DEST_KEY}"
   UP_EXIT=$?
   set -e
   if [ $UP_EXIT -eq 0 ]; then
-    log "✅ Upload successful!"
-    break
-  else
-    warn "Upload failed (exit $UP_EXIT). Retrying in 5s..."
-    sleep 5
+    log "Upload finished. Trying checksum verification..."
+    set +e
+    REMOTE_CHECKSUM=$(aws_run s3api head-object --bucket "${S3_BUCKET}" --key "${DEST_KEY}" --query 'ChecksumSHA256' --output text 2>/dev/null || true)
+    set -e
+    if [ -n "${REMOTE_CHECKSUM}" ] && [ "${REMOTE_CHECKSUM}" != "None" ]; then
+      if [ "${REMOTE_CHECKSUM}" = "${ARCHIVE_SHA256}" ]; then
+        log "Checksum verified."
+        UP_EXIT=0
+        break
+      else
+        warn "Remote checksum mismatch."
+        UP_EXIT=1
+      fi
+    else
+      # fallback: best-effort acceptance for multipart / ETag cases
+      log "Remote checksum not available; proceeding but please verify if strict checksum required."
+      UP_EXIT=0
+      break
+    fi
   fi
+
+  warn "Attempt ${upload_attempt} failed (exit ${UP_EXIT}). Sleeping ${BACKOFF}s..."
+  sleep "${BACKOFF}"
+  BACKOFF=$((BACKOFF * 2))
 done
 
 if [ $UP_EXIT -ne 0 ]; then
-  error_exit "Upload failed after ${MAX_UPLOAD_RETRIES} attempts. Archive left at ${ARCHIVE_PATH}"
+  error_exit "Upload failed after ${MAX_UPLOAD_RETRIES} attempts. Archive at ${ARCHIVE_PATH}"
+fi
+log "Upload succeeded: s3://${S3_BUCKET}/${DEST_KEY}"
+
+# Optionally remove local archive
+if [[ "${REMOVE_LOCAL,,}" =~ ^(y|yes)$ ]]; then
+  rm -f "${ARCHIVE_PATH}" && log "Removed ${ARCHIVE_PATH}"
 fi
 
-# ===== CLEANUP =====
-log "Cleaning local archives older than ${RETENTION_DAYS} days..."
-find "${BACKUP_DIR}" -type f -name "backup-*.tar.gz" -mtime +"${RETENTION_DAYS}" -print -exec rm -f {} \;
+# Sync seeded local folders to their S3 prefixes (so local .seed files are uploaded)
+if [[ "${SYNC_SEEDED,,}" =~ ^(y|yes)$ ]]; then
+  for p in "${PREFIXES[@]}"; do
+    p_noslash="${p%/}"
+    localdir="${BACKUP_DIR}/${p_noslash}"
+    s3dest="${p}"
+    log "Syncing ${localdir}/ -> s3://${S3_BUCKET}/${s3dest}"
+    set +e
+    aws_run s3 sync "${localdir}/" "s3://${S3_BUCKET}/${s3dest}" --exact-timestamps
+    SYNC_EXIT=$?
+    set -e
+    if [ $SYNC_EXIT -ne 0 ]; then
+      warn "Sync failed for ${localdir} (exit ${SYNC_EXIT})."
+    else
+      log "Synced ${localdir} -> s3://${S3_BUCKET}/${s3dest}"
+    fi
+  done
+fi
 
-log "✅ Backup complete!"
-log "Remote path: s3://${S3_BUCKET}/${DEST_KEY}"
+# cleanup old archives
+log "Removing local archives older than ${RETENTION_DAYS} days in ${BACKUP_DIR}..."
+find "${BACKUP_DIR}" -type f -name "backup-*.tar.gz" -mtime +"${RETENTION_DAYS}" -print -exec rm -f {} \; || warn "Cleanup returned non-zero"
+
+log "Done. Main archive: s3://${S3_BUCKET}/${DEST_KEY}"
 exit 0
